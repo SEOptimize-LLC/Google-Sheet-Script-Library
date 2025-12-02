@@ -1,0 +1,154 @@
+/**
+ * adds a custom menu to the active spreadsheet.
+ */
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('GSC Audit Tools')
+      .addItem('Split Tabs by Coverage', 'splitTabsByCoverage')
+      .addToUi();
+}
+
+/**
+ * Main function to filter, generate a dashboard, and split data into tabs.
+ */
+function splitTabsByCoverage() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getActiveSheet();
+  
+  // Get all data from the active sheet
+  var range = sheet.getDataRange();
+  var values = range.getValues();
+  
+  // Separate headers and data
+  var headers = values[0];
+  var data = values.slice(1); // All rows except the header
+  
+  // Find the column indices for "Summary" and "Coverage"
+  // We use indexOf to find them dynamically in case columns move
+  var summaryIndex = headers.indexOf("Summary");
+  var coverageIndex = headers.indexOf("Coverage");
+  
+  // Error handling if columns aren't found
+  if (summaryIndex === -1 || coverageIndex === -1) {
+    SpreadsheetApp.getUi().alert('Error: Could not find columns named "Summary" or "Coverage". Please check your headers.');
+    return;
+  }
+  
+  // The Summary statuses we want to target
+  var targetSummaries = [
+    "URL is on Google, but has issues",
+    "URL is not on Google"
+  ];
+  
+  // Object to hold our grouped data
+  // Structure: { "Page with redirect": [row1, row2], "Another Status": [row1, row2] }
+  var groupedData = {};
+  var foundRows = 0;
+
+  // Iterate through all data rows
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var summaryValue = row[summaryIndex];
+    var coverageValue = row[coverageIndex];
+    
+    // Check if the Summary matches our target criteria
+    if (targetSummaries.indexOf(summaryValue) !== -1) {
+      
+      // If coverage is empty, skip or label it "Unknown"
+      if (!coverageValue) coverageValue = "Unknown Status";
+
+      // Initialize array for this coverage type if it doesn't exist
+      if (!groupedData[coverageValue]) {
+        groupedData[coverageValue] = [];
+      }
+      
+      // Add the row to the group
+      groupedData[coverageValue].push(row);
+      foundRows++;
+    }
+  }
+
+  // If no matching data found, stop
+  if (foundRows === 0) {
+    SpreadsheetApp.getUi().alert('No rows found matching the criteria ("URL is on Google, but has issues" or "URL is not on Google").');
+    return;
+  }
+
+  // Convert the grouped object into an array so we can sort it
+  var sortedGroups = [];
+  for (var type in groupedData) {
+    sortedGroups.push({
+      name: type,
+      rows: groupedData[type]
+    });
+  }
+
+  // Sort the array by number of rows (descending order: most URLs to least)
+  sortedGroups.sort(function(a, b) {
+    return b.rows.length - a.rows.length;
+  });
+
+  // --- 1. Create Overview Dashboard ---
+  var dashboardName = "Overview Dashboard";
+  var dashboardSheet = ss.getSheetByName(dashboardName);
+  
+  if (dashboardSheet) {
+    dashboardSheet.clear();
+    // Ensure it's in the second position (index 1) if it exists
+    ss.setActiveSheet(dashboardSheet);
+    ss.moveActiveSheet(2); 
+  } else {
+    // Insert at index 1 (second position, right after the first tab)
+    dashboardSheet = ss.insertSheet(dashboardName, 1);
+  }
+
+  // Prepare Dashboard Data
+  var dashboardData = [["Coverage Status", "Number of URLs"]]; // Header row
+  for (var i = 0; i < sortedGroups.length; i++) {
+    dashboardData.push([sortedGroups[i].name, sortedGroups[i].rows.length]);
+  }
+
+  // Write Dashboard Data
+  dashboardSheet.getRange(1, 1, dashboardData.length, 2).setValues(dashboardData);
+  
+  // Style the Dashboard (Bold header, gray background for header)
+  var headerRange = dashboardSheet.getRange(1, 1, 1, 2);
+  headerRange.setFontWeight("bold");
+  headerRange.setBackground("#efefef");
+  dashboardSheet.autoResizeColumns(1, 2);
+
+
+  // --- 2. Create Tabs for each group ---
+  for (var i = 0; i < sortedGroups.length; i++) {
+    var group = sortedGroups[i];
+    var sheetName = group.name;
+    var rowsToWrite = group.rows;
+    
+    // Sheet names cannot be longer than 100 chars, truncate if necessary
+    if (sheetName.length > 100) {
+      sheetName = sheetName.substring(0, 100);
+    }
+    
+    // Check if sheet exists, if so clear it, if not create it
+    var targetSheet = ss.getSheetByName(sheetName);
+    if (targetSheet) {
+      targetSheet.clear(); // Clear existing content
+    } else {
+      // Insert new sheet at the end
+      targetSheet = ss.insertSheet(sheetName, ss.getNumSheets());
+    }
+    
+    // Write Headers
+    targetSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    
+    // Write Data
+    if (rowsToWrite.length > 0) {
+      targetSheet.getRange(2, 1, rowsToWrite.length, headers.length).setValues(rowsToWrite);
+    }
+    
+    // Optional: Auto-resize columns for better visibility
+    targetSheet.autoResizeColumns(1, headers.length);
+  }
+
+  SpreadsheetApp.getUi().alert('Success! Created "Overview Dashboard" and ' + sortedGroups.length + ' detail tabs.');
+}
