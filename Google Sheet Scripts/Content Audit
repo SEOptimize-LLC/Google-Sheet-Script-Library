@@ -1,0 +1,330 @@
+/**
+ * Creates a custom menu in the Google Sheet UI when opened.
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Content Audit')
+      .addItem('Run Audit', 'runContentAudit')
+      .addToUi();
+}
+
+/**
+ * Automates the Content Audit Sheet population.
+ * keys: Landing Page URL.
+ */
+function runContentAudit() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+
+  // --- SAFETY CHECK: CONFIRMATION DIALOG ---
+  const response = ui.alert(
+    'Start Content Audit?',
+    'This will update the Main Tab with data from the other tabs. Do you want to continue?',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (response !== ui.Button.YES) {
+    return;
+  }
+  
+  // --- CONFIGURATION: TAB NAMES ---
+  const SHEET_MAIN = "Main Tab";
+  const SHEET_SF = "SF Tab";
+  const SHEET_GSC = "GSC Report";
+  const SHEET_BLOG = "Blog Dates";
+  const SHEET_SV = "Search Volume";
+  
+  // --- 1. SETUP & VALIDATION ---
+  const mainSheet = ss.getSheetByName(SHEET_MAIN);
+  if (!mainSheet) { ui.alert(`Sheet "${SHEET_MAIN}" not found.`); return; }
+  
+  // --- 2. CHECK IF MAIN TAB IS EMPTY & POPULATE URLS ---
+  // If the Main Tab only has headers (1 row), we need to fetch URLs from SF Tab first.
+  if (mainSheet.getLastRow() <= 1) {
+    const sfSheet = ss.getSheetByName(SHEET_SF);
+    if (sfSheet) {
+      const sfData = sfSheet.getDataRange().getValues();
+      const sfHeaders = sfData[0];
+      const addrIndex = sfHeaders.indexOf("Address"); // SF uses "Address"
+      
+      if (addrIndex > -1) {
+        // Extract URLs, filter empty ones, filter NON-HTML, and ensure uniqueness
+        const urls = sfData.slice(1)
+          .map(r => r[addrIndex])
+          .filter(u => u && isValidContentUrl(u)); // <--- NEW FILTER APPLIED HERE
+
+        const uniqueUrls = [...new Set(urls)].map(u => [u]); // Format for setValues [[url], [url]]
+        
+        if (uniqueUrls.length > 0) {
+          // Paste URLs into Column A (index 1) starting at row 2
+          mainSheet.getRange(2, 1, uniqueUrls.length, 1).setValues(uniqueUrls);
+          SpreadsheetApp.flush(); // Force update so the next steps can read these URLs
+        }
+      } else {
+        ui.alert("Could not find 'Address' column in SF Tab to populate URLs.");
+        return;
+      }
+    } else {
+      ui.alert("SF Tab not found. Cannot populate URLs.");
+      return;
+    }
+  }
+
+  // --- 3. FETCH SOURCE DATA INTO MEMORY (For Performance) ---
+  const svMap = getSearchVolumeMap(ss.getSheetByName(SHEET_SV));
+  const gscMap = getGscAggregates(ss.getSheetByName(SHEET_GSC), svMap);
+  const blogMap = getBlogDatesMap(ss.getSheetByName(SHEET_BLOG));
+  const sfMap = getSfDataMap(ss.getSheetByName(SHEET_SF));
+
+  // --- 4. PROCESS MAIN TAB ---
+  const dataRange = mainSheet.getDataRange();
+  const values = dataRange.getValues();
+  const headers = values[0];
+  
+  // Create a map of column names to their index (0-based)
+  const h = {}; 
+  headers.forEach((col, i) => h[col.trim()] = i);
+
+  // Helper to safely set value if header exists
+  const setVal = (row, headerName, value) => {
+    if (h.hasOwnProperty(headerName)) row[h[headerName]] = value;
+  };
+
+  const today = new Date();
+
+  // Loop through data rows (skip header)
+  for (let i = 1; i < values.length; i++) {
+    let row = values[i];
+    const url = row[h["Landing Page"]];
+    
+    if (!url) continue; // Skip empty rows
+
+    const cleanUrl = String(url).trim();
+    
+    // --- FILTER: Skip processing for non-content URLs ---
+    if (!isValidContentUrl(cleanUrl)) continue;
+
+    // --- A. DATE & DAYS SINCE ---
+    if (blogMap.has(cleanUrl)) {
+      const dateData = blogMap.get(cleanUrl);
+      
+      // Write Formatted Date
+      setVal(row, "Published Dates", dateData.formattedDate);
+      
+      // Calculate Days Since (Static Number)
+      const diffTime = Math.abs(today - dateData.objDate);
+      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); 
+      setVal(row, "Days Since Published", diffDays);
+    }
+
+    // --- B. SF TAB METRICS ---
+    if (sfMap.has(cleanUrl)) {
+      const sf = sfMap.get(cleanUrl);
+      
+      setVal(row, "Status Code", sf.statusCode);
+      setVal(row, "Indexed Status", sf.indexability);
+      setVal(row, "Title Length", sf.titleLen);
+      setVal(row, "Word Count", sf.wordCount);
+      setVal(row, "Crawl Depth", sf.crawlDepth);
+      setVal(row, "Unique InLinks", sf.inlinks);
+      setVal(row, "Unique OutLinks", sf.outlinks);
+      setVal(row, "Sessions", sf.sessions);
+      setVal(row, "Page Views", sf.pageviews);
+      setVal(row, "Clicks", sf.clicks);
+      setVal(row, "Imps", sf.imps);
+      setVal(row, "URL CTR", sf.ctr);
+      setVal(row, "Avg. Pos", sf.position);
+      setVal(row, "Days Since Last Crawl", sf.daysSinceCrawl);
+      setVal(row, "Perf Score", sf.perfScore);
+      setVal(row, "TTFB", sf.ttfb);
+      setVal(row, "LCP", sf.lcp);
+      setVal(row, "TTI", sf.tti);
+      setVal(row, "TBT", sf.tbt);
+      setVal(row, "CLS", sf.cls);
+    }
+
+    // --- C. GSC & SEARCH VOLUME METRICS ---
+    if (gscMap.has(cleanUrl)) {
+      const gsc = gscMap.get(cleanUrl);
+      setVal(row, "# Queries", gsc.queryCount);
+      setVal(row, "Search Volume", gsc.totalVolume);
+    }
+  }
+
+  // --- 5. WRITE DATA BACK ---
+  mainSheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+  
+  ui.alert("Audit Complete! Processed " + (values.length - 1) + " URLs.");
+}
+
+/**
+ * NEW HELPER: VALIDATE CONTENT URL
+ * Returns true if URL looks like a web page, false if image/js/css/sitemap.
+ */
+function isValidContentUrl(url) {
+  if (!url) return false;
+  const lower = String(url).toLowerCase().trim();
+  
+  // 1. Exclude Sitemap paths
+  if (lower.includes("site-map") || lower.includes("sitemap")) return false;
+
+  // 2. Exclude non-HTML extensions (images, css, js, docs, etc.)
+  // Matches extension at end of string, optionally followed by query params or hash
+  const nonHtmlRegex = /\.(jpg|jpeg|png|gif|webp|svg|ico|css|js|xml|txt|pdf|zip|rar|tar|gz|mp3|mp4|avi|mov|wmv)(\?.*|#.*)?$/i;
+  
+  if (nonHtmlRegex.test(lower)) return false;
+
+  return true;
+}
+
+/**
+ * 1. MAP SEARCH VOLUME
+ * Returns Map: "keyword" -> volume (number)
+ */
+function getSearchVolumeMap(sheet) {
+  const map = new Map();
+  if (!sheet) return map;
+  
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const colKw = headers.indexOf("Keyword");
+  const colVol = headers.indexOf("US Search Volume"); 
+
+  if (colKw === -1 || colVol === -1) return map;
+
+  for (let i = 1; i < data.length; i++) {
+    const kw = String(data[i][colKw]).trim().toLowerCase();
+    const vol = data[i][colVol];
+    if (kw) map.set(kw, Number(vol) || 0);
+  }
+  return map;
+}
+
+/**
+ * 2. AGGREGATE GSC DATA
+ * Returns Map: "url" -> { queryCount: int, totalVolume: int }
+ */
+function getGscAggregates(sheet, svMap) {
+  const map = new Map();
+  if (!sheet) return map;
+
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  
+  // Find columns loosely
+  const findCol = (name) => headers.findIndex(h => h.toLowerCase().includes(name.toLowerCase()));
+  
+  const colPage = findCol("page"); 
+  const colQuery = findCol("query");
+
+  if (colPage === -1 || colQuery === -1) return map;
+
+  for (let i = 1; i < data.length; i++) {
+    const url = String(data[i][colPage]).trim();
+    const query = String(data[i][colQuery]).trim().toLowerCase();
+    
+    if (!url) continue;
+
+    if (!map.has(url)) {
+      map.set(url, { queryCount: 0, totalVolume: 0, seenQueries: new Set() });
+    }
+
+    const entry = map.get(url);
+    
+    if (!entry.seenQueries.has(query)) {
+      entry.seenQueries.add(query);
+      entry.queryCount += 1;
+      
+      if (svMap.has(query)) {
+        entry.totalVolume += svMap.get(query);
+      }
+    }
+  }
+  return map;
+}
+
+/**
+ * 3. MAP BLOG DATES
+ * Returns Map: "url" -> { formattedDate: "MM/dd/yyyy", objDate: DateObject }
+ */
+function getBlogDatesMap(sheet) {
+  const map = new Map();
+  if (!sheet) return map;
+
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  
+  const colAddr = headers.indexOf("Address");
+  const colPub = headers.indexOf("Published Time 1");
+  const colMod = headers.indexOf("Modified Time 1");
+
+  if (colAddr === -1) return map;
+
+  for (let i = 1; i < data.length; i++) {
+    const url = String(data[i][colAddr]).trim();
+    const pubRaw = data[i][colPub];
+    const modRaw = data[i][colMod];
+
+    let targetDate = modRaw && String(modRaw).trim() !== "" ? modRaw : pubRaw;
+
+    if (targetDate) {
+      const dateObj = new Date(targetDate);
+      if (!isNaN(dateObj.getTime())) {
+        const fmt = Utilities.formatDate(dateObj, Session.getScriptTimeZone(), "MM/dd/yyyy");
+        map.set(url, { formattedDate: fmt, objDate: dateObj });
+      }
+    }
+  }
+  return map;
+}
+
+/**
+ * 4. MAP SF DATA
+ * Returns Map: "url" -> { object with all metrics }
+ */
+function getSfDataMap(sheet) {
+  const map = new Map();
+  if (!sheet) return map;
+
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const h = {};
+  headers.forEach((col, i) => h[col.trim()] = i);
+
+  // Helper to get val by name
+  const get = (row, name) => row[h[name]];
+
+  const colAddr = h["Address"];
+  if (colAddr === undefined) return map;
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const url = String(row[colAddr]).trim();
+    
+    if (!url) continue;
+
+    map.set(url, {
+      statusCode: get(row, "Status Code"),
+      indexability: get(row, "Indexability"), 
+      titleLen: get(row, "Title 1 Length"),
+      wordCount: get(row, "Word Count"),
+      crawlDepth: get(row, "Crawl Depth"),
+      inlinks: get(row, "Unique Inlinks"),
+      outlinks: get(row, "Unique Outlinks"),
+      sessions: get(row, "Sessions"),
+      pageviews: get(row, "Page Views"),
+      clicks: get(row, "Clicks"),
+      imps: get(row, "Impressions"),
+      ctr: get(row, "CTR"),
+      position: get(row, "Position"),
+      daysSinceCrawl: get(row, "Days Since Last Crawl"),
+      perfScore: get(row, "Performance Score"),
+      ttfb: get(row, "Time to First Byte (ms)"), 
+      lcp: get(row, "Largest Contentful Paint Time (ms)"),
+      tti: get(row, "Time to Interactive (ms)"),
+      tbt: get(row, "Total Blocking Time (ms)"),
+      cls: get(row, "Cumulative Layout Shift")
+    });
+  }
+  return map;
+}
